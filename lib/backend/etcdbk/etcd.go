@@ -1,5 +1,5 @@
 /*
-Copyright 2015 Gravitational, Inc.
+Copyright 2015-2018 Gravitational, Inc.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,20 +18,26 @@ limitations under the License.
 package etcdbk
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"io/ioutil"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/gravitational/teleport/lib/backend"
 	"github.com/gravitational/teleport/lib/defaults"
+	"github.com/gravitational/teleport/lib/tlsca"
 	"github.com/gravitational/teleport/lib/utils"
 
-	"github.com/coreos/etcd/client"
-	"github.com/coreos/etcd/pkg/transport"
+	"github.com/coreos/etcd/clientv3"
+	"github.com/coreos/etcd/etcdserver/api/v3rpc/rpctypes"
 	"github.com/gravitational/trace"
 	"github.com/jonboulle/clockwork"
 	"golang.org/x/net/context"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type bk struct {
@@ -39,8 +45,7 @@ type bk struct {
 
 	cfg     *Config
 	etcdKey string
-	client  client.Client
-	api     client.KeysAPI
+	client  *clientv3.Client
 	cancelC chan bool
 	stopC   chan bool
 	clock   clockwork.Clock
@@ -120,7 +125,7 @@ func (b *bk) Clock() clockwork.Clock {
 }
 
 func (b *bk) Close() error {
-	return nil
+	return b.client.Close()
 }
 
 func (b *bk) key(keys ...string) string {
@@ -128,32 +133,49 @@ func (b *bk) key(keys ...string) string {
 }
 
 func (b *bk) reconnect() error {
-	tlsInfo := transport.TLSInfo{
-		CAFile:   b.cfg.TLSCAFile,
-		CertFile: b.cfg.TLSCertFile,
-		KeyFile:  b.cfg.TLSKeyFile,
-	}
-	tr, err := transport.NewTransport(tlsInfo, defaults.DefaultDialTimeout)
+	clientCertPEM, err := ioutil.ReadFile(b.cfg.TLSCertFile)
 	if err != nil {
-		return trace.Wrap(err)
+		return trace.ConvertSystemError(err)
 	}
-	clt, err := client.New(client.Config{
-		Endpoints:               b.nodes,
-		Transport:               tr,
-		HeaderTimeoutPerRequest: defaults.ReadHeadersTimeout,
+	clientKeyPEM, err := ioutil.ReadFile(b.cfg.TLSKeyFile)
+	if err != nil {
+		return trace.ConvertSystemError(err)
+	}
+	caCertPEM, err := ioutil.ReadFile(b.cfg.TLSCAFile)
+	if err != nil {
+		return trace.ConvertSystemError(err)
+	}
+	tlsConfig := utils.TLSConfig(nil)
+	tlsCert, err := tls.X509KeyPair(clientCertPEM, clientKeyPEM)
+	if err != nil {
+		return trace.BadParameter("failed to parse private key: %v", err)
+	}
+	certPool := x509.NewCertPool()
+	parsedCert, err := tlsca.ParseCertificatePEM(caCertPEM)
+	if err != nil {
+		return trace.Wrap(err, "failed to parse CA certificate")
+	}
+	certPool.AddCert(parsedCert)
+
+	tlsConfig.Certificates = []tls.Certificate{tlsCert}
+	tlsConfig.RootCAs = certPool
+	tlsConfig.ClientCAs = certPool
+
+	clt, err := clientv3.New(clientv3.Config{
+		Endpoints:   b.nodes,
+		TLS:         tlsConfig,
+		DialTimeout: defaults.DefaultDialTimeout,
 	})
 	if err != nil {
 		return trace.Wrap(err)
 	}
 	b.client = clt
-	b.api = client.NewKeysAPI(b.client)
-
 	return nil
 }
 
 // GetItems fetches keys and values and returns them to the caller.
 func (b *bk) GetItems(path []string) ([]backend.Item, error) {
-	items, err := b.getItems(b.key(path...))
+	items, err := b.getItems(b.key(path...), false, clientv3.WithSerializable(), clientv3.WithPrefix())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -163,7 +185,7 @@ func (b *bk) GetItems(path []string) ([]backend.Item, error) {
 
 // GetKeys fetches keys (and values) but only returns keys to the caller.
 func (b *bk) GetKeys(path []string) ([]string, error) {
-	items, err := b.getItems(b.key(path...))
+	items, err := b.getItems(b.key(path...), true, clientv3.WithSerializable(), clientv3.WithKeysOnly(), clientv3.WithPrefix())
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -178,11 +200,29 @@ func (b *bk) GetKeys(path []string) ([]string, error) {
 }
 
 func (b *bk) CreateVal(path []string, key string, val []byte, ttl time.Duration) error {
-	_, err := b.api.Set(
-		context.Background(),
-		b.key(append(path, key)...), base64.StdEncoding.EncodeToString(val),
-		&client.SetOptions{PrevExist: client.PrevNoExist, TTL: ttl})
-	return trace.Wrap(convertErr(err))
+	var opts []clientv3.OpOption
+	if ttl > 0 {
+		if ttl/time.Second <= 0 {
+			return trace.BadParameter("TTL should be in seconds, got %v instead", ttl)
+		}
+		lease, err := b.client.Grant(context.Background(), int64(ttl/time.Second))
+		if err != nil {
+			return convertErr(err)
+		}
+		opts = []clientv3.OpOption{clientv3.WithLease(lease.ID)}
+	}
+	keyPath := b.key(append(path, key)...)
+	re, err := b.client.Txn(context.Background()).
+		If(clientv3.Compare(clientv3.CreateRevision(keyPath), "=", 0)).
+		Then(clientv3.OpPut(keyPath, base64.StdEncoding.EncodeToString(val), opts...)).
+		Commit()
+	if err != nil {
+		return trace.Wrap(convertErr(err))
+	}
+	if !re.Succeeded {
+		return trace.AlreadyExists("%q already exists", key)
+	}
+	return nil
 }
 
 // CompareAndSwapVal compares and swap values in atomic operation,
@@ -193,16 +233,33 @@ func (b *bk) CompareAndSwapVal(path []string, key string, val []byte, prevVal []
 	if len(prevVal) == 0 {
 		return trace.BadParameter("missing prevVal parameter, to atomically create item, use CreateVal method")
 	}
-	encodedPrev := base64.StdEncoding.EncodeToString(prevVal)
-	_, err := b.api.Set(
-		context.Background(),
-		b.key(append(path, key)...), base64.StdEncoding.EncodeToString(val),
-		&client.SetOptions{PrevValue: encodedPrev, PrevExist: client.PrevExist, TTL: ttl})
-	err = convertErr(err)
-	if trace.IsNotFound(err) {
-		return trace.CompareFailed(err.Error())
+	var opts []clientv3.OpOption
+	if ttl > 0 {
+		if ttl/time.Second <= 0 {
+			return trace.BadParameter("TTL should be in seconds, got %v instead", ttl)
+		}
+		lease, err := b.client.Grant(context.Background(), int64(ttl/time.Second))
+		if err != nil {
+			return convertErr(err)
+		}
+		opts = []clientv3.OpOption{clientv3.WithLease(lease.ID)}
 	}
-	return trace.Wrap(err)
+	keyPath := b.key(append(path, key)...)
+	encodedPrev := base64.StdEncoding.EncodeToString(prevVal)
+	re, err := b.client.Txn(context.Background()).
+		If(clientv3.Compare(clientv3.Value(keyPath), "=", encodedPrev)).
+		Then(clientv3.OpPut(keyPath, base64.StdEncoding.EncodeToString(val), opts...)).
+		Commit()
+	if err != nil {
+		err = convertErr(err)
+		if trace.IsNotFound(err) {
+			return trace.CompareFailed(err.Error())
+		}
+	}
+	if !re.Succeeded {
+		return trace.CompareFailed("key %q did not match expected value", key)
+	}
+	return nil
 }
 
 // maxOptimisticAttempts is the number of attempts optimistic locking
@@ -213,44 +270,79 @@ func (bk *bk) UpsertItems(bucket []string, items []backend.Item) error {
 }
 
 func (b *bk) UpsertVal(path []string, key string, val []byte, ttl time.Duration) error {
-	_, err := b.api.Set(
+	var opts []clientv3.OpOption
+	if ttl > 0 {
+		if ttl/time.Second <= 0 {
+			return trace.BadParameter("TTL should be in seconds, got %v instead", ttl)
+		}
+		lease, err := b.client.Grant(context.Background(), int64(ttl/time.Second))
+		if err != nil {
+			return convertErr(err)
+		}
+		opts = []clientv3.OpOption{clientv3.WithLease(lease.ID)}
+	}
+	_, err := b.client.Put(
 		context.Background(),
-		b.key(append(path, key)...), base64.StdEncoding.EncodeToString(val), &client.SetOptions{TTL: ttl})
+		b.key(append(path, key)...),
+		base64.StdEncoding.EncodeToString(val),
+		opts...)
 	return convertErr(err)
 }
 
 func (b *bk) GetVal(path []string, key string) ([]byte, error) {
-	re, err := b.api.Get(context.Background(), b.key(append(path, key)...), nil)
-	if err != nil {
-		return nil, convertErr(err)
+	re, err := b.client.Get(context.Background(), b.key(append(path, key)...), clientv3.WithSerializable())
+	if err == nil && len(re.Kvs) != 0 {
+		bytes, err := unmarshal(re.Kvs[0].Value)
+		if err != nil {
+			return nil, trace.Wrap(err)
+		}
+		return bytes, nil
+	} else if err != nil {
+		err = convertErr(err)
+		if !trace.IsNotFound(err) {
+			return nil, trace.Wrap(err)
+		}
 	}
-	if re.Node.Dir {
-		return nil, trace.BadParameter("'%v': trying to get value of bucket", key)
-	}
-	value, err := base64.StdEncoding.DecodeString(re.Node.Value)
-	if err != nil {
+
+	// now, check that it's a directory (this is a temp workaround)
+	// before we refactor the backend interface
+	re, err = b.client.Get(context.Background(), b.key(append(path, key)...), clientv3.WithPrefix(), clientv3.WithSerializable(), clientv3.WithCountOnly())
+	if err := convertErr(err); err != nil {
 		return nil, trace.Wrap(err)
 	}
-	return value, nil
+	if re.Count != 0 {
+		return nil, trace.BadParameter("%q: trying to get value of bucket", key)
+	}
+	return nil, trace.NotFound("%q is not found", key)
 }
 
 func (b *bk) DeleteKey(path []string, key string) error {
-	_, err := b.api.Delete(context.Background(), b.key(append(path, key)...), nil)
-	return convertErr(err)
+	re, err := b.client.Delete(context.Background(), b.key(append(path, key)...))
+	if err != nil {
+		return trace.Wrap(convertErr(err))
+	}
+	if re.Deleted == 0 {
+		return trace.NotFound("%q is not found", key)
+	}
+	return nil
 }
 
 func (b *bk) DeleteBucket(path []string, key string) error {
-	_, err := b.api.Delete(context.Background(), b.key(append(path, key)...), &client.DeleteOptions{Dir: true, Recursive: true})
-	return convertErr(err)
+	re, err := b.client.Delete(context.Background(), b.key(append(path, key)...), clientv3.WithPrefix())
+	if err != nil {
+		return trace.Wrap(convertErr(err))
+	}
+	if re.Deleted == 0 {
+		return trace.NotFound("%q is not found", key)
+	}
+	return nil
 }
 
 const delayBetweenLockAttempts = 100 * time.Millisecond
 
 func (b *bk) AcquireLock(token string, ttl time.Duration) error {
 	for {
-		_, err := b.api.Set(
-			context.Background(),
-			b.key("locks", token), "lock", &client.SetOptions{TTL: ttl, PrevExist: client.PrevNoExist})
+		err := b.CreateVal([]string{"locks"}, token, []byte("lock"), ttl)
 		err = convertErr(err)
 		if err == nil {
 			return nil
@@ -265,71 +357,88 @@ func (b *bk) AcquireLock(token string, ttl time.Duration) error {
 }
 
 func (b *bk) ReleaseLock(token string) error {
-	_, err := b.api.Delete(context.Background(), b.key("locks", token), nil)
-	return convertErr(err)
+	re, err := b.client.Delete(context.Background(), b.key("locks", token))
+	if err != nil {
+		return trace.Wrap(convertErr(err))
+	}
+	if re.Deleted == 0 {
+		return trace.NotFound("%q is not found", token)
+	}
+	return nil
+}
+
+func unmarshal(value []byte) ([]byte, error) {
+	if len(value) == 0 {
+		return nil, trace.BadParameter("missing value")
+	}
+	dbuf := make([]byte, base64.StdEncoding.DecodedLen(len(value)))
+	n, err := base64.StdEncoding.Decode(dbuf, value)
+	return dbuf[:n], err
 }
 
 // getItems fetches keys and values and returns them to the caller.
-func (b *bk) getItems(path string) ([]backend.Item, error) {
+func (b *bk) getItems(path string, keysOnly bool, opts ...clientv3.OpOption) ([]backend.Item, error) {
 	var vals []backend.Item
 
-	re, err := b.api.Get(context.Background(), path, nil)
-	if er := convertErr(err); er != nil {
-		if trace.IsNotFound(er) {
+	re, err := b.client.Get(context.Background(), path, opts...)
+	if err := convertErr(err); err != nil {
+		if trace.IsNotFound(err) {
 			return vals, nil
 		}
-		return nil, trace.Wrap(er)
-	}
-	if !isDir(re.Node) {
-		return nil, trace.BadParameter("'%v': expected directory", path)
+		return nil, trace.Wrap(err)
 	}
 
-	// Convert etcd response of *client.Response to backend.Item.
-	for _, n := range re.Node.Nodes {
-		valueBytes, err := base64.StdEncoding.DecodeString(n.Value)
-		if err != nil {
-			return nil, trace.Wrap(err)
+	items := make([]backend.Item, 0, len(re.Kvs))
+	for _, kv := range re.Kvs {
+		if strings.Compare(path, string(kv.Key[:len(path)])) == 0 && len(path) < len(kv.Key) {
+			item := backend.Item{
+				Key: suffix(string(kv.Key[len(path)+1:])),
+			}
+			if !keysOnly {
+				value, err := unmarshal(kv.Value)
+				if err != nil {
+					return nil, trace.Wrap(err)
+				}
+				item.Value = value
+			}
+			items = append(items, item)
 		}
-
-		vals = append(vals, backend.Item{
-			Key:   suffix(n.Key),
-			Value: valueBytes,
-		})
 	}
-
-	// Sort and return results.
-	sort.Slice(vals, func(i, j int) bool {
-		return vals[i].Key < vals[j].Key
-	})
-
-	return vals, nil
+	sort.Sort(backend.Items(items))
+	return items, nil
 }
 
-func convertErr(e error) error {
-	if e == nil {
+func convertErr(err error) error {
+	if err == nil {
 		return nil
 	}
-	switch err := e.(type) {
-	case client.Error:
-		switch err.Code {
-		case client.ErrorCodeKeyNotFound:
+	if err == context.Canceled {
+		return trace.ConnectionProblem(err, "operation has been cancelled")
+	} else if err == context.DeadlineExceeded {
+		return trace.ConnectionProblem(err, "operation has timed out")
+	} else if err == rpctypes.ErrEmptyKey {
+		return trace.BadParameter(err.Error())
+	} else if ev, ok := status.FromError(err); ok {
+		switch ev.Code() {
+		// server-side context might have timed-out first (due to clock skew)
+		// while original client-side context is not timed-out yet
+		case codes.DeadlineExceeded:
+			return trace.ConnectionProblem(err, "operation has timed out")
+		case codes.NotFound:
 			return trace.NotFound(err.Error())
-		case client.ErrorCodeNotFile:
-			return trace.BadParameter(err.Error())
-		case client.ErrorCodeNodeExist:
+		case codes.AlreadyExists:
 			return trace.AlreadyExists(err.Error())
-		case client.ErrorCodeTestFailed:
+		case codes.FailedPrecondition:
 			return trace.CompareFailed(err.Error())
+		default:
+			return trace.BadParameter(err.Error())
 		}
 	}
-	return e
-}
-
-func isDir(n *client.Node) bool {
-	return n != nil && n.Dir == true
+	// bad cluster endpoints, which are not etcd servers
+	return trace.ConnectionProblem(err, "bad cluster endpoints")
 }
 
 func suffix(key string) string {
 	vals := strings.Split(key, "/")
-	return vals[len(vals)-1]
+	return vals[0]
 }
